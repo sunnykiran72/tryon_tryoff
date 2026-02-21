@@ -1,102 +1,59 @@
-# `/analyze` API Architecture & Code Review Analysis
+# Parserless Garment Split Refactoring Plan
 
-## 1. Executive Summary & Flow Overview
+## 1. The Core Problem
 
-The `/analyze` endpoint serves as the core orchestration layer for digitizing a user's garments. The flow expertly bridges local detection (YOLO), robust semantic verification (CLIP & Human Parsing models), and Generative Try-On fallback (Fashn V1.5) for flawless garment extraction.
+The current `/analyze` API fails to identify obvious two-piece outfits (like a pink tucked-in shirt with black pants, or a striped crop top with black pants) when running without a heavy human parsing model (`ANALYZE_USE_HUMAN_PARSER = false`).
 
-**The Expected Workflow (as implemented):**
+It falsely forces these images into a single "Dress" or generic garment path due to brittle, rigid heuristics inside `src/api_features/yolo_cropper.py`.
 
-1. **Intake & Validation:** Receives a multipart image upload with an optional `type`. Evaluates image dimensions and blurriness using OpenCV logic.
-2. **YOLO Detection (`_build_yolo_item_breakdown_from_image`):** Runs YOLO detection to generate bounding boxes (Top, Bottom, Dress, Outerwear), crops the items, and generates individual previews (`item_breakdown`).
-3. **User Feedback Loop:** If `type` is absent and multiple isolated garments are detected, the endpoint gracefully pauses execution by returning a `400 MULTI_ITEM_SELECTION_REQUIRED` with cropped garment options to let the user pick the intended garment.
-4. **Target Extraction (`extract_cloth_with_fallback_types`):** Once a distinct `selected_item` is chosen, the system invokes the `handle_extract_cloth` sequence.
-5. **Quality-Gated Fallback (Fashn V1.5 VTON):** The semantic segmentation attempts to parse the garment. If it fails the occlusion threshold logic (`proxy_occlusion_ratio` >= max limit), or if the parser fails to properly identify the pixels, it hits the Fashn-powered Try-On fallback via `_run_vton_cloth_only_fallback` to hallucinate obscured parts like waistbands and collars realistically.
-6. **Persistence:** Final validated crops are sent to Azure Blob Storage, and the API returns standard metadata for UI rendering.
+## 2. Root Cause Analysis
 
----
+The failures in the `_likely_two_piece_from_person_region` function stem from two major logic flaws:
 
-## 2. Strengths & Positive Architectural Choices
+### Flaw A: Geometry Clamps on Tucked-in Shirts (Image 1 Failure)
 
-### A. Intelligent YOLO Implementation & Crop Management
+- **The Issue:** The code requires a *poor* `waist_x_alignment` to validate a color-based split (`waist_x_alignment <= 0.86`).
+- **The Result:** If a user wears a perfectly tucked-in shirt, the left and right hip contours align seamlessly. The algorithmic `waist_x_alignment` scores near `0.95`. The code sees this perfect silhouette, ignores the massive color contrast between the shirt and pants, and falsely assumes it is a single color-blocked dress.
 
-The code shows excellent maturity in managing YOLO edge cases:
+### Flaw B: Static Height Split Assumptions (Image 2 Failure)
 
-- **Low Confidence Splits:** In cases where YOLO detects a broad "person" area or a low-score dress, the code utilizes a fallback routine (`ANALYZE_LOW_CONFIDENCE_SPLIT_TO_MULTI`) which automatically slices the prediction down the waist and uses CLIP classification to identify `top` and `bottom` candidates reliably.
-- **Top / Bottom Isolation Strategy:** For a user specifically requesting a `top` (`ANALYZE_USE_ISOLATED_TOP_CROP`), it deliberately limits the crop to avoid bleeding into bottom areas. Inversely, for `bottoms`, the raw full-length crop remains intact so waistbands and overlapping belts are retained.
-- **Pre-flight Occlusion Profiling (`score_occlusion_proxy`):** Before risking a bad generic extraction, the system compares the target's bounding box to nearby objects/arms. If `proxy_occlusion_ratio` determines it’s deeply occluded by hair, hands, or accessories, it cleanly routes it to Fashn V1.5.
-
-### B. Graceful VTON Fallback (Fashn V1.5)
-
-The logic surrounding the VTON fallback is highly robust:
-
-- Maps Python categories nicely to the VTON API specs: `"top", "outer" -> "tops"`, `"bottom" -> "bottoms"`, `"dress" -> "one-pieces"`.
-- Uses `segmentation_free=True` for complex pieces like bottoms, delegating boundary determination to the generative capability instead of rigid parsers.
-- Features `ANALYZE_FORCE_VTON_FOR_SINGLE_PIECE_DRESS`, proving an explicit understanding that dresses are very commonly occluded by moving arms and almost universally benefit from the Fashn generative model.
-
-### C. Strong API Hygiene
-
-Payload formations (`_build_success_payload`, `_build_error_payload`, `_multipart_form_response`) standardise responses. Azure Blob Storage integration is seamless alongside JWT authentication.
+- **The Issue:** The `_compute_split_geometry` function assumes a person's waist is always located at exactly `45%`, `49%`, or `54%` down their bounding box. It then samples a very narrow 10% vertical band at that static location.
+- **The Result:** For high-waisted pants, crop tops, or photos cropped above the knees, the true "waist" line shifts. If the hardcoded 45% mark lands entirely over the black pants, the algorithm sees only black pixels above and below the line. It detects zero color difference and zero skin, completely missing the crop top located slightly higher up the torso.
 
 ---
 
-## 3. Critiques & Critical Warnings (To Fix Immediately)
+## 3. Proposed Refactoring Solution
 
-While the feature logic is extremely impressive, the **ASGI API execution implementation is bottlenecked.**
+We must abandon static assumptions and rigid geometry clamps. Instead, we need to implement a **Dynamic Waist Search** and **Perfect Tuck Detection**.
 
-### 🚨 1. Synchronous Requests in an Async Endpoint
+### Initiative 1: Dynamic Split Line Search
 
-The `handle_analyze_multipart` function is defined as `async def`, running in the main event loop context. It calls `await _extract_cloth_with_fallback_types()`, which internally calls `run_vton_cloth_only_fallback()`.
+Instead of guessing where the waist is based on a rigid bounding box ratio, the algorithm must dynamically scan the torso region to find the true separation line.
 
-Inside `src/api_features/vton_fallback.py`:
+1. **Scan the Torso Matrix:** Evaluate horizontal pixel slices across the middle 50% of the bounding box (e.g., from `y = 25%` down to `y = 75%`).
+2. **Find the Contrast Peak:** Calculate the color variance and edge density for each horizontal slice. The true boundary between a top and bottom will register as the slice with the maximum vertical color gradient.
+3. **Anchor the Split:** Set `split_y` to this dynamically discovered peak contrast line, ensuring we are actually comparing the top garment to the bottom garment, regardless of high-waisted pants or crop-top proportions.
 
-```python
-response = requests.post(endpoint, json=payload, timeout=max(10, config.extract_vton_timeout_s))
-```
+### Initiative 2: Perfect Tuck Tolerance
 
-**The Problem:** `requests.post` is completely synchronous and blocking. Because FastAPI runs on a single-threaded asynchronous Event Loop, **using a synchronous, long-running HTTP call (up to 45 seconds timeout on Fashn API) blocks the entire server.** No other users can connect or process requests while waiting for Fashn to respond.
+We must decouple massive color differences from silhouette geometry constraints.
 
-**The Fix:**
-Replace `requests` with an asynchronous HTTP client `httpx` inside `vton_fallback.py` to keep the API non-blocking.
+1. **Bypass Geometry Clamps for High Contrast:** If the `color_dist` is exceptionally high (e.g., `> 0.25`, like bright pink vs deep black), the system should instantly classify it as a two-piece, even if the `waist_x_alignment` is a flawless `1.0`.
+2. **Reserve Geometry for Ambiguity:** The `waist_x_alignment` check should only be enforced when the color difference is ambiguous or low (e.g., a navy top with black jeans). In those cases, a bulky overhang (poor alignment) serves securely as tie-breaker evidence of two separate pieces.
 
-```python
-import httpx
+### Initiative 3: Robust Skin Span Detection
 
-async def run_vton_cloth_only_fallback_async(image_url: str, garment_type: str, ...)
-    async with httpx.AsyncClient() as client:
-        response = await client.post(endpoint, json=payload, timeout=...)
-```
+For crop tops where color contrast might be lower but skin is clearly visible:
 
-*Note: This will require propagating the `await` keyword up through the `maybe_execute_vton_fallback` chain.*
+1. **Continuous Horizontal Skin Tracking:** Instead of just measuring the overall percentage of skin in a region (`skin_ratio`), measure the longest continuous horizontal contiguous run of skin pixels (`horizontal_skin_span`).
+2. **The Crop Top Rule:** If a horizontal skin band completely severs the torso from left to right (spanning >80% of the width), it is definitively a crop-top and bottom combination. This distinguishes it successfully from a single dress with a deep V-neck or side-cutouts (which do not sever the horizontal axis).
 
-### 🚨 2. Unsafe JSON Parsing in Fashn Fallback
+## 4. Expected Code Changes
 
-If the Fashn server has an internal error (e.g., `502 Bad Gateway` returning a generic HTML page instead of JSON), the script does:
+**Target File:** `src/api_features/yolo_cropper.py`
 
-```python
-if response.status_code != 200:
-    raise RuntimeError(...)
-result = response.json()
-```
-
-If the API theoretically responds `200 OK` but returns malformed proxy traffic or non-JSON content, `.json()` triggers a synchronous exception that is raised without adequate HTTP parsing catch blocks.
-**The Fix:** Wrap the `.json()` reading in a `try...except ValueError` block.
-
-### 🚨 3. Blocking IO for Base64 / PIL Encodings
-
-In functions like `_build_yolo_item_breakdown_from_image`, heavy PIL (Python Imaging Library) image manipulations and PNG encoding (`crop_image.save(out_buf, format="PNG")`) happen inside the async loop. For low traffic, this is fine. For high concurrency, it is recommended to wrap CPU-bound operations in `run_in_threadpool`.
-
----
-
-## 4. Final Review on Top / Bottom / Dress Proper Extraction
-
-The strategy used for isolating these three key types is **highly successful and thoughtful:**
-
-- **Top Extraction:** Effectively checks `ANALYZE_USE_ISOLATED_TOP_CROP`. It properly isolates crops and ensures styles like "shirt" and "sweater" fall gracefully back to Fashn when arm overlap creates parser limitations.
-- **Bottom Extraction:** Ensures the entire waist to ankle is sent into the VTON generator using `segmentation_free=True`, avoiding the traditional VTON flaw where waistbands are severed unnecessarily.
-- **Dress Extraction:** Incorporating `ANALYZE_FORCE_VTON_FOR_SINGLE_PIECE_DRESS` forces dresses to bypass the human parser entirely and utilize Fashn when `occlusion_ratio` exceeds the threshold. This guarantees dresses are completed smoothly since they suffer the most from hand/knee overlaps in raw photos.
-
-### Conclusion
-
-The structural logic built around **YOLO → User Validation → Adaptive Extraction (Semantic vs. Fashn V1.5)** is **excellent and achieves your goals**.
-
-To make it production-ready, the most critical improvement needed is **refactoring `vton_fallback.py` to use asynchronous HTTP requests (`httpx.AsyncClient`)** to ensure your server doesn't freeze when communicating with Fashn.
+- **Modify `_compute_split_geometry`:** Remove the static `aspect >= 2.8` hardcoded ratios. Replace with a dynamic vertical scan returning the highest-contrast `y` coordinate.
+- **Modify `_likely_two_piece_from_person_region`:**
+  - Implement the "Perfect Tuck" bypass rule for extreme `color_dist`.
+  - Ensure `waist_x_alignment` is only checked as a secondary fallback constraint.
+  - Enhance the `horizontal_skin_span` logic to require a full horizontal severance to trigger the crop-top rule.
