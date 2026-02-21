@@ -144,6 +144,16 @@ def _is_generic_garment_candidate(
     return True
 
 
+def _mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    a = mask_a.astype(bool)
+    b = mask_b.astype(bool)
+    inter = int((a & b).sum())
+    union = int((a | b).sum())
+    if union <= 0:
+        return 0.0
+    return float(inter / union)
+
+
 def _resolve_detector_model_paths(explicit_path: Optional[str] = None) -> List[str]:
     candidates = [
         explicit_path or "",
@@ -299,7 +309,29 @@ def detect_garment_instances(
                 generic_fallback_instances.append(instance_payload)
 
         instances = strict_instances if strict_instances else generic_fallback_instances
+        
+        # If we have specific garment boxes, suppress the redundant 'person' boxes
+        # which often just wrap the same area and cause MULTI_ITEM prompts.
+        has_garments = any(inst.get("is_garment_class") for inst in instances)
+        if has_garments:
+            instances = [inst for inst in instances if not inst.get("is_person")]
+
         instances.sort(key=lambda item: (int(item["area"]), float(item.get("detector_conf", 0.0))), reverse=True)
+        if len(instances) > 1:
+            deduped_instances: List[Dict[str, object]] = []
+            for instance in instances:
+                duplicate = False
+                for kept in deduped_instances:
+                    same_type = str(instance.get("garment_type", "")) == str(kept.get("garment_type", ""))
+                    if not same_type:
+                        continue
+                    iou = _mask_iou(instance["mask"], kept["mask"])
+                    if iou >= 0.90:
+                        duplicate = True
+                        break
+                if not duplicate:
+                    deduped_instances.append(instance)
+            instances = deduped_instances
         instances = instances[: max(1, max_items)]
         if instances:
             attempts.append({"model_path": path, "status": "ok"})

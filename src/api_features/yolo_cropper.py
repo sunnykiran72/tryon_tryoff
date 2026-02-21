@@ -383,9 +383,10 @@ def _split_single_component_top_bottom(
     base_class_id = int(component.get("class_id", -1))
     base_class_name = str(component.get("class_name", "person"))
     reason_code = int(round(float(split_signal_debug.get("reason_code", 0.0) or 0.0)))
-    # Keep explicit multi-item only for strong waist-skin evidence or extreme high contrast.
-    # Color/texture-only split signals with moderate contrast are allowed to merge back into dress later.
-    prevent_single_piece_merge = reason_code in {10, 11, 14}
+    # Keep explicit multi-item only for strong waist-skin evidence (likely crop top).
+    # Color/texture-only splits (code 11/12/13/14) are allowed to merge back into dress later
+    # if the geometry or parser confirms it looks like a single piece.
+    prevent_single_piece_merge = reason_code in {10}
     split_signal_strength = "strong_multi" if prevent_single_piece_merge else "weak_multi"
     return [
         {
