@@ -923,6 +923,7 @@ def build_yolo_item_breakdown_from_image(
         image_height=source_image.height,
         min_item_pixels=min_item_pixels,
         parsing=parsing,
+        source_image=source_image,
     )
     selected_components = size_filtered_components[:max_items]
 
