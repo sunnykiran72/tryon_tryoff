@@ -189,17 +189,17 @@ PARSING_MODEL_PATH = os.getenv("PARSING_MODEL_PATH", "mattmdjaga/segformer_b2_cl
 PARSING_DEVICE = os.getenv("PARSING_DEVICE", "cpu").lower()
 PARSING_TORCH_DTYPE = os.getenv("PARSING_TORCH_DTYPE", "auto").lower()
 ENABLE_MASK_REFINEMENT = os.getenv("ENABLE_MASK_REFINEMENT", "true").lower() == "true"
-MASK_KEEP_COMPONENTS = int(os.getenv("MASK_KEEP_COMPONENTS", "1"))
-MASK_MIN_COMPONENT_AREA_RATIO = float(os.getenv("MASK_MIN_COMPONENT_AREA_RATIO", "0.0015"))
+MASK_KEEP_COMPONENTS = int(os.getenv("MASK_KEEP_COMPONENTS", "2"))
+MASK_MIN_COMPONENT_AREA_RATIO = float(os.getenv("MASK_MIN_COMPONENT_AREA_RATIO", "0.001"))
 MASK_EDGE_FEATHER_PX = int(os.getenv("MASK_EDGE_FEATHER_PX", "2"))
 MASK_EDGE_MIN_ALPHA = int(os.getenv("MASK_EDGE_MIN_ALPHA", "10"))
 DRESS_SECOND_COMPONENT_ENABLE = os.getenv("DRESS_SECOND_COMPONENT_ENABLE", "true").lower() == "true"
-DRESS_SECOND_COMPONENT_MIN_MAIN_AREA_RATIO = float(os.getenv("DRESS_SECOND_COMPONENT_MIN_MAIN_AREA_RATIO", "0.02"))
-DRESS_SECOND_COMPONENT_MAX_GAP_PX = int(os.getenv("DRESS_SECOND_COMPONENT_MAX_GAP_PX", "120"))
+DRESS_SECOND_COMPONENT_MIN_MAIN_AREA_RATIO = float(os.getenv("DRESS_SECOND_COMPONENT_MIN_MAIN_AREA_RATIO", "0.01"))
+DRESS_SECOND_COMPONENT_MAX_GAP_PX = int(os.getenv("DRESS_SECOND_COMPONENT_MAX_GAP_PX", "256"))
 DRESS_SECOND_COMPONENT_MIN_X_OVERLAP = float(os.getenv("DRESS_SECOND_COMPONENT_MIN_X_OVERLAP", "0.15"))
 LOAD_TRYON_MODEL_ON_STARTUP = os.getenv("LOAD_TRYON_MODEL_ON_STARTUP", "false").lower() == "true"
 DETECT_USE_YOLO = os.getenv("DETECT_USE_YOLO", "true").lower() == "true"
-DETECT_YOLO_MIN_CONF = float(os.getenv("DETECT_YOLO_MIN_CONF", "0.2"))
+DETECT_YOLO_MIN_CONF = float(os.getenv("DETECT_YOLO_MIN_CONF", "0.25"))
 DETECT_YOLO_IOU = float(os.getenv("DETECT_YOLO_IOU", "0.5"))
 DETECT_YOLO_MIN_AREA_RATIO = float(os.getenv("DETECT_YOLO_MIN_AREA_RATIO", "0.002"))
 DETECT_MIN_ITEM_PIXELS = int(os.getenv("DETECT_MIN_ITEM_PIXELS", "0"))
@@ -213,8 +213,8 @@ DETECT_FRAGMENT_DOMINANCE_MIN_RATIO = float(os.getenv("DETECT_FRAGMENT_DOMINANCE
 DETECT_SINGLE_PIECE_MERGE_ENABLED = os.getenv("DETECT_SINGLE_PIECE_MERGE_ENABLED", "true").lower() == "true"
 DETECT_SINGLE_PIECE_DRESS_HINT_MIN_RATIO = float(os.getenv("DETECT_SINGLE_PIECE_DRESS_HINT_MIN_RATIO", "0.90"))
 DETECT_SINGLE_PIECE_MIN_X_OVERLAP = float(os.getenv("DETECT_SINGLE_PIECE_MIN_X_OVERLAP", "0.45"))
-DETECT_SINGLE_PIECE_MAX_VERTICAL_GAP_PX = int(os.getenv("DETECT_SINGLE_PIECE_MAX_VERTICAL_GAP_PX", "24"))
-DETECT_SINGLE_PIECE_MAX_VERTICAL_GAP_RATIO = float(os.getenv("DETECT_SINGLE_PIECE_MAX_VERTICAL_GAP_RATIO", "0.03"))
+DETECT_SINGLE_PIECE_MAX_VERTICAL_GAP_PX = int(os.getenv("DETECT_SINGLE_PIECE_MAX_VERTICAL_GAP_PX", "64"))
+DETECT_SINGLE_PIECE_MAX_VERTICAL_GAP_RATIO = float(os.getenv("DETECT_SINGLE_PIECE_MAX_VERTICAL_GAP_RATIO", "0.08"))
 DETECT_PARSING_TYPE_OVERRIDE_MIN_SCORE = float(os.getenv("DETECT_PARSING_TYPE_OVERRIDE_MIN_SCORE", "0.35"))
 EXTRACT_OCCLUSION_PREFILTER_ENABLED = os.getenv("EXTRACT_OCCLUSION_PREFILTER_ENABLED", "true").lower() == "true"
 EXTRACT_OCCLUSION_PROXY_THRESHOLD = float(os.getenv("EXTRACT_OCCLUSION_PROXY_THRESHOLD", "0.24"))
@@ -1515,7 +1515,8 @@ def _postprocess_single_piece_candidates(
                         color_dist = float(np.linalg.norm(top_med - bot_med) / 255.0)
                         texture_delta = abs(top_std - bot_std)
                         
-                        if color_dist < 0.12 and texture_delta < 0.04:
+                        # Increased thresholds slightly to be more permissive for patterned/textured dresses
+                        if color_dist < 0.20 and texture_delta < 0.08:
                             parserless_single_piece_candidate = True
                             dress_hint_ratio = 1.0
                             debug["native_yolo_perfect_color_match"] = True

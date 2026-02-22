@@ -323,11 +323,10 @@ def detect_garment_instances(
             for instance in instances:
                 duplicate = False
                 for kept in deduped_instances:
-                    same_type = str(instance.get("garment_type", "")) == str(kept.get("garment_type", ""))
-                    if not same_type:
-                        continue
                     iou = _mask_iou(instance["mask"], kept["mask"])
-                    if iou >= 0.90:
+                    # Aggressive deduplication: drop near-identical masks regardless of label
+                    # if they overlap by more than 85%.
+                    if iou >= 0.85:
                         duplicate = True
                         break
                 if not duplicate:
