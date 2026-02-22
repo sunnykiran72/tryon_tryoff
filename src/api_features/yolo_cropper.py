@@ -75,6 +75,49 @@ def crop_from_bbox_with_padding(
     return cropped_image, cropped_mask, (x0, y0, x1, y1)
 
 
+def _expand_bbox_for_preview(
+    *,
+    bbox: Tuple[int, int, int, int],
+    garment_type: str,
+    image_width: int,
+    image_height: int,
+    base_padding_px: int,
+) -> Tuple[int, int, int, int]:
+    """
+    Type-aware bbox expansion for clearer split previews:
+    - `top`: keep tighter bottom edge (avoid unnecessary lower-space).
+    - `bottom`: add extra top context (avoid waistband truncation).
+    - `dress`/others: keep symmetric padding.
+    """
+    x0, y0, x1, y1 = [int(v) for v in bbox]
+    pad = max(0, int(base_padding_px))
+    gtype = str(garment_type or "").strip().lower()
+
+    pad_left = pad
+    pad_right = pad
+    pad_top = pad
+    pad_bottom = pad
+
+    if gtype in {"top", "outer"}:
+        # Keep top focused and reduce dead space below.
+        pad_bottom = max(1, int(round(pad * 0.35)))
+    elif gtype == "bottom":
+        # Preserve waistband/hip context; this reduces top truncation.
+        pad_top = max(pad, int(round(pad * 1.8)), int(round(image_height * 0.03)))
+        pad_bottom = max(pad, int(round(pad * 0.8)))
+
+    x0 = max(0, x0 - pad_left)
+    y0 = max(0, y0 - pad_top)
+    x1 = min(image_width, x1 + pad_right)
+    y1 = min(image_height, y1 + pad_bottom)
+
+    if x1 <= x0:
+        x0, x1 = 0, image_width
+    if y1 <= y0:
+        y0, y1 = 0, image_height
+    return (x0, y0, x1, y1)
+
+
 def _bbox_from_mask(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
     ys, xs = np.where(mask.astype(bool))
     if len(xs) == 0 or len(ys) == 0:
@@ -941,11 +984,18 @@ def build_yolo_item_breakdown_from_image(
                 component_padding_px,
                 int(max(16, round(0.06 * max(source_image.width, source_image.height)))),
             )
+        expanded_bbox = _expand_bbox_for_preview(
+            bbox=tuple(inst.get("bbox", (0, 0, source_image.width, source_image.height))),
+            garment_type=str(inst.get("garment_type", "")),
+            image_width=source_image.width,
+            image_height=source_image.height,
+            base_padding_px=component_padding_px,
+        )
         crop_image, crop_mask, crop_bbox = crop_from_bbox_with_padding(
             image=source_image,
             mask=component_mask,
-            bbox=tuple(inst.get("bbox", (0, 0, source_image.width, source_image.height))),
-            padding_px=component_padding_px,
+            bbox=expanded_bbox,
+            padding_px=0,
             fallback_crop_fn=deps.crop_with_padding_fn,
         )
         x0, y0, x1, y1 = crop_bbox

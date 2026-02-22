@@ -275,12 +275,13 @@ def detect_garment_instances(
             h_ratio_local = float(max(1, y1 - y0) / max(1, h))
             if garment_type is None and is_person:
                 garment_type = _infer_garment_type_from_bbox(y0, y1, h)
-            elif garment_type == "top" and h_ratio_local >= 0.75:
-                # Override YOLO classification if the geometry explicitly screams dress
-                # but YOLO mistakenly predicted "shirt".
-                # Only override if the garment also spans the vertical center and extends
-                # into the lower half (to avoid mislabeling zoomed-in crop tops).
-                if y1 > h * 0.85 and y0 < h * 0.15:
+            elif garment_type == "top" and h_ratio_local >= 0.68:
+                # Guard against full-length/one-piece dresses mislabeled as "shirt".
+                # Keep strict lower-coverage requirements so true tops/crop-tops are not remapped.
+                spans_upper_body = y0 < h * 0.32
+                reaches_lower_body = y1 > h * 0.78
+                large_area = area_ratio >= 0.14
+                if spans_upper_body and reaches_lower_body and large_area:
                     garment_type = "dress"
             instance_payload = {
                 "mask": mask_bool,
