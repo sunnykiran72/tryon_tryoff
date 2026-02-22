@@ -129,18 +129,18 @@ def _compute_dynamic_split_y(crop_rgb: np.ndarray, crop_mask: np.ndarray) -> int
     h, w = crop_rgb.shape[:2]
     aspect = float(h / max(1, w))
     if aspect >= 2.8:
-        base_split = 0.45
+        base_split = 0.42
     elif aspect >= 2.2:
-        base_split = 0.49
+        base_split = 0.46
     else:
-        base_split = 0.54
+        base_split = 0.52
     best_y = int(h * base_split)
     
     if h < 80 or w < 40:
         return best_y
         
-    start_y = int(h * 0.25)
-    end_y = int(h * 0.65)
+    start_y = int(h * 0.18)
+    end_y = int(h * 0.58)
     
     max_gradient = -1.0
     window = max(2, int(h * 0.04))
@@ -157,8 +157,12 @@ def _compute_dynamic_split_y(crop_rgb: np.ndarray, crop_mask: np.ndarray) -> int
                 top_mean = np.mean(top_pixels, axis=0)
                 bot_mean = np.mean(bot_pixels, axis=0)
                 diff = float(np.linalg.norm(top_mean - bot_mean) / 255.0)
-                if diff > max_gradient:
-                    max_gradient = diff
+                # Bias towards waist-like regions near base_split so we avoid
+                # overly-low boundaries that truncate bottom waistbands.
+                dist_penalty = 0.15 * abs((float(y) / max(1.0, float(h))) - base_split)
+                score = diff - dist_penalty
+                if score > max_gradient:
+                    max_gradient = score
                     best_y = y
                 
     return best_y
@@ -185,10 +189,14 @@ def _compute_split_geometry(
         split_y = int(y0 + (split_ratio * h))
         
     split_y = max(y0 + 1, min(y1 - 1, split_y))
-    overlap_px = max(10, min(52, int(h * 0.07)))
-    top_end = min(y1, split_y + overlap_px)
-    bottom_start = max(y0, split_y - overlap_px)
-    return split_y, overlap_px, top_end, bottom_start
+    # Asymmetric overlap improves split previews:
+    # - top keeps tighter lower context (less dead lower space)
+    # - bottom keeps richer upper context (avoid waistband truncation)
+    top_overlap_px = max(8, min(40, int(h * 0.05)))
+    bottom_overlap_px = max(16, min(72, int(h * 0.11)))
+    top_end = min(y1, split_y + top_overlap_px)
+    bottom_start = max(y0, split_y - bottom_overlap_px)
+    return split_y, max(top_overlap_px, bottom_overlap_px), top_end, bottom_start
 
 
 def _likely_two_piece_from_person_region(

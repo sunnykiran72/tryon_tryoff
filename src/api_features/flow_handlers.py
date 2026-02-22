@@ -127,9 +127,11 @@ def _split_crop_for_forced_type_from_items(
     else:
         split_ratio = 0.54
     split_y = max(1, min(h - 1, int(h * split_ratio)))
-    # Substantial overlap (18%) to ensure body context for Fashion V1.5
-    top_overlap = max(32, min(120, int(h * 0.18)))
-    bottom_overlap = max(32, min(120, int(h * 0.18)))
+    # Asymmetric overlap for better framing:
+    # - top: tighter lower context (avoid unnecessary bottom area)
+    # - bottom: larger upper context (preserve waistband/hip seam)
+    top_overlap = max(20, min(72, int(h * 0.10)))
+    bottom_overlap = max(40, min(140, int(h * 0.20)))
 
     tops = [b for b in bboxes if b[0] in {"top", "outer"}]
     bottoms = [b for b in bboxes if b[0] == "bottom"]
@@ -137,11 +139,18 @@ def _split_crop_for_forced_type_from_items(
 
     kind = (forced_type or "").strip().lower()
     if kind == "top":
-        # Prefer explicit top/outer extent; otherwise cut right above bottom start.
-        if tops:
-            boundary = max(b[4] for b in tops)  # max y1
+        # Prefer a midpoint between top and bottom when both exist.
+        if tops and bottoms:
+            top_edge = max(b[4] for b in tops)
+            bottom_edge = min(b[2] for b in bottoms)
+            if bottom_edge > top_edge:
+                boundary = int((top_edge + bottom_edge) / 2)
+            else:
+                boundary = int(max(top_edge, bottom_edge))
+        elif tops:
+            boundary = max(b[4] for b in tops)
         elif bottoms:
-            boundary = min(b[2] for b in bottoms)  # min y0
+            boundary = min(b[2] for b in bottoms)
         elif dresses:
             # Dress-only detections: upper portion as top proxy.
             d = max(dresses, key=lambda b: b[4] - b[2])
@@ -152,11 +161,18 @@ def _split_crop_for_forced_type_from_items(
         return image.crop((0, 0, w, top_end))
 
     if kind == "bottom":
-        # Prefer explicit bottom start; otherwise start below top/outer extent.
-        if bottoms:
-            boundary = min(b[2] for b in bottoms)  # min y0
+        # Prefer a midpoint between top and bottom when both exist.
+        if tops and bottoms:
+            top_edge = max(b[4] for b in tops)
+            bottom_edge = min(b[2] for b in bottoms)
+            if bottom_edge > top_edge:
+                boundary = int((top_edge + bottom_edge) / 2)
+            else:
+                boundary = int(max(top_edge, bottom_edge))
+        elif bottoms:
+            boundary = min(b[2] for b in bottoms)
         elif tops:
-            boundary = max(b[4] for b in tops)  # max y1
+            boundary = max(b[4] for b in tops)
         elif dresses:
             d = max(dresses, key=lambda b: b[4] - b[2])
             boundary = int(d[2] + 0.38 * (d[4] - d[2]))
@@ -1434,6 +1450,27 @@ async def handle_analyze_multipart(file, authorization, selected_type, ctx):
             # In no-type mode, once the detector already resolved to a single dress
             # candidate, do not branch into low-confidence top/bottom split.
             likely_single_full_piece = True
+
+        # Dress guard (no-type path):
+        # Some long-sleeve/full-length dresses are mislabeled as "top" by detector.
+        # Promote to dress only when geometry clearly indicates a single long piece.
+        promote_top_like_dress = (
+            not requested_selected_type
+            and len(item_breakdown) == 1
+            and selected_item_type == "top"
+            and selected_class_id not in {0, -1}
+            and selected_h_ratio >= 0.58
+            and selected_w_ratio >= 0.24
+            and y0_ratio <= 0.34
+            and y1_ratio >= 0.76
+        )
+        if promote_top_like_dress:
+            selected_item["garment_type"] = "dress"
+            selected_item["type"] = "dress"
+            selected_item["garment_type_source"] = "geometry_promoted_dress"
+            selected_item_type = "dress"
+            likely_single_full_piece = True
+            should_split_to_multi = False
         if likely_single_full_piece:
             should_split_to_multi = False
 
