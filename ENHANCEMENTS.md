@@ -116,3 +116,29 @@ The dress has a significant cut-out at the waist, creating two separate pixel "i
 - **Aggressive Deduplication:** Lower the deduplication IoU threshold to 0.85 to catch near-duplicates.
 - **Centric Priority:** Prioritize the largest centered component and attempt to merge nearby fragments of the same color/texture.
 - **Label Smoothing:** Force merger of disjointed islands if they share identical color histograms and vertical alignment.
+
+---
+
+## Issue 6: Zoom-Dependent Detection Variance (Crop Top Cropping)
+
+### **Image Evidence (Crochet Crop Top)**
+
+- **Original:** `crochet_crop_top_full.png` (Wide shot: 2 items found, correct).
+- **Failure State:** `crochet_crop_top_zoom.png` (Zoomed shot: `INVALID_SELECTION_TYPE` when requesting "top").
+
+### **The Problem (Zoom-Induced Over-Classification)**
+
+The same outfit behaves differently depending on the image crop.
+
+- **Full Shot:** The system correctly sees a "top" and a "bottom" (Multiple Items).
+- **Zoomed Shot:** The crop top fills a large vertical percentage of the cropped frame. The system overrides the YOLO "shirt" label to **"dress"** due to the height ratio.
+- **The Result:** When the user selects "top", the API returns a 400 error because it only "sees" a dress, even though it's clearly the top the user wants.
+
+### **Technical Root Cause (Context Loss)**
+
+In zoomed photos, the "image height" is no longer a reliable proxy for "person height." A 12-inch crop top in a 15-inch photo looks like a "massive item" (0.80 ratio), triggering the dress override logic.
+
+### **Resolution Strategy (Zoom Consistency)**
+
+- **Cross-Type Satisfaction:** Modify `flow_handlers.py` to allow a `dress` result to satisfy a `top` or `bottom` request if it's the only valid item found and the original YOLO class was a shirt/pants.
+- **Improved Center-of-Mass Check:** Only override to "dress" if the item spans both the upper and lower quadrants of the detected person region.
