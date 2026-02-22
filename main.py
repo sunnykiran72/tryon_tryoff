@@ -137,7 +137,9 @@ except ImportError:
     RealESRGANer = None
     RRDBNet = None
 
-load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
+# Keep runtime environment variables authoritative over .env defaults.
+# This is critical in deployments where model paths are injected at startup.
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("any2any-tryoff")
 
@@ -1484,9 +1486,23 @@ def _postprocess_single_piece_candidates(
         max(0, int(max(0.0, DETECT_SINGLE_PIECE_MAX_VERTICAL_GAP_RATIO) * max(1, int(image_height)))),
     )
 
+    # If YOLO natively output a Top and Bottom with explicit garment classes,
+    # preserve multi-item behavior. Do not force-merge into dress by color match.
+    top_source = str(top_candidate.get("source", "")).lower().strip()
+    bottom_source = str(bottom_candidate.get("source", "")).lower().strip()
+    top_class_id = int(top_candidate.get("class_id", -1))
+    bottom_class_id = int(bottom_candidate.get("class_id", -1))
+    native_explicit_top_bottom_pair = (
+        top_source == "yolo"
+        and bottom_source == "yolo"
+        and top_class_id not in {0, -1}
+        and bottom_class_id not in {0, -1}
+    )
+
     # If YOLO natively output a Top and Bottom but they completely align,
-    # evaluate if they form a perfect color/texture match (solid dress logic)
-    if not parserless_single_piece_candidate and source_image is not None:
+    # evaluate if they form a perfect color/texture match (solid dress logic).
+    # Skip this path for native explicit pairs to avoid collapsing true two-piece outfits.
+    if not parserless_single_piece_candidate and source_image is not None and not native_explicit_top_bottom_pair:
         if x_overlap >= max(0.0, DETECT_SINGLE_PIECE_MIN_X_OVERLAP) and vertical_gap <= max_gap_px:
             try:
                 top_mask = np.asarray(top_candidate.get("mask", np.zeros((1, 1), dtype=bool))).astype(bool)
@@ -1524,6 +1540,8 @@ def _postprocess_single_piece_candidates(
                             debug["texture_delta"] = round(texture_delta, 4)
             except Exception:
                 pass
+    elif native_explicit_top_bottom_pair:
+        debug["native_yolo_pair_preserved_multi"] = True
 
     if dress_hint_ratio < max(0.0, DETECT_SINGLE_PIECE_DRESS_HINT_MIN_RATIO):
         debug.update(
