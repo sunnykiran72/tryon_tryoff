@@ -19,11 +19,12 @@ In the latest logs, the user tried to select the **"top"** from a two-piece set.
 
 ### **Technical Root Cause (Crop Set)**
 
-The `h_ratio_local >= 0.60` check in `garment_detector.py` is too aggressive for crop-top photos where the person is zoomed in. Because the crop top + partial pants took up most of the frame, the code assumed it was a dress.
+Historically, the `h_ratio_local >= 0.60` check in `garment_detector.py` was too aggressive for crop-top photos where the person is zoomed in. Because the crop top + partial pants took up most of the frame, the code assumed it was a dress.
 
 ### **Resolution Strategy (Crop Set)**
 
-- **Tighten Dress Override:** Increase the height ratio required for the dress override or add a check for skin/gap presence before force-labeling as a dress. (Fixed: Raised to 0.75 ratio).
+- **Tighten Dress Override:** Increase the height ratio required for the dress override or add a check for skin/gap presence before force-labeling as a dress.
+  - **Current code status:** The active guard in `src/garment_detector.py` is `h_ratio_local >= 0.75` and only overrides `top -> dress` when the box spans near full-body vertical extent (`y0 < 0.15h` and `y1 > 0.85h`). This was tightened to reduce crop-top false positives.
 - **Support Type Fallbacks:** If a user selects `top` but we found a `dress` that covers the top half, we should allow the VTON process to continue rather than rejecting it.
 
 ---
@@ -116,6 +117,7 @@ The dress has a significant cut-out at the waist, creating two separate pixel "i
 - **Aggressive Deduplication:** Lower the deduplication IoU threshold to 0.85 to catch near-duplicates.
 - **Centric Priority:** Prioritize the largest centered component and attempt to merge nearby fragments of the same color/texture.
 - **Label Smoothing:** Force merger of disjointed islands if they share identical color histograms and vertical alignment.
+  - **Current code status:** Implemented at detector-mask level (`IoU >= 0.85` dedup) plus bbox-level dedup in analyzer post-processing.
 
 ---
 
@@ -142,3 +144,25 @@ In zoomed photos, the "image height" is no longer a reliable proxy for "person h
 
 - **Cross-Type Satisfaction:** Modify `flow_handlers.py` to allow a `dress` result to satisfy a `top` or `bottom` request if it's the only valid item found and the original YOLO class was a shirt/pants.
 - **Improved Center-of-Mass Check:** Only override to "dress" if the item spans both the upper and lower quadrants of the detected person region.
+
+---
+
+## Commit Review Notes (2026-02-22)
+
+Verified commit chain:
+
+- `d83b403`: introduced top->dress geometry override for very tall "top" detections.
+- `f7a6374`: added single-piece merge logic for native YOLO split outputs (color/texture bridge).
+- `fefe4b8`: stabilized dress routing and multi-item behavior.
+- `36850e0`: introduced this enhancement tracking document.
+- `56aae74`: added duplication-focused improvements.
+- `c8b864b`: zoom stability and cross-type routing adjustments.
+- `330649d`: dynamic waist split and high-contrast tuck bypass in `yolo_cropper`.
+- `577c803`: prevented forced single-piece merge when split signal is strong.
+
+### Audit Findings
+
+- Dress override guard is currently `0.75` with vertical-span constraints (`y0 < 0.15h`, `y1 > 0.85h`) in `src/garment_detector.py`.
+- "Fixed in main.py" is partially true for merge logic, but related routing now also lives in `src/api_features/flow_handlers.py` and detector behavior in `src/garment_detector.py`.
+- Bottom metadata specificity (`jeans`, `trousers`, etc.) depends on detector class-name mapping and forced-type routing logic in `flow_handlers.py`; generic `Bottom` still appears when style confidence is weak or fallback style is used.
+- Current repository state has a coherent commit sequence but a non-clean working tree (many untracked files), so any production release should use a cleanup/curation pass before tagging.
