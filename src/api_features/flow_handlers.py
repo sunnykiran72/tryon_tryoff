@@ -74,8 +74,9 @@ def _split_crop_for_forced_type(image: Image.Image, forced_type: str) -> Image.I
     else:
         split_ratio = 0.54
     split_y = max(1, min(h - 1, int(h * split_ratio)))
-    top_overlap = max(6, min(28, int(h * 0.03)))
-    bottom_overlap = max(10, min(52, int(h * 0.07)))
+    # Substantial overlap (18%) to ensure body context for Fashion V1.5
+    top_overlap = max(32, min(120, int(h * 0.18)))
+    bottom_overlap = max(32, min(120, int(h * 0.18)))
     top_end = min(h, split_y + top_overlap)
     bottom_start = max(0, split_y - bottom_overlap)
 
@@ -126,8 +127,9 @@ def _split_crop_for_forced_type_from_items(
     else:
         split_ratio = 0.54
     split_y = max(1, min(h - 1, int(h * split_ratio)))
-    top_overlap = max(6, min(28, int(h * 0.03)))
-    bottom_overlap = max(10, min(52, int(h * 0.07)))
+    # Substantial overlap (18%) to ensure body context for Fashion V1.5
+    top_overlap = max(32, min(120, int(h * 0.18)))
+    bottom_overlap = max(32, min(120, int(h * 0.18)))
 
     tops = [b for b in bboxes if b[0] in {"top", "outer"}]
     bottoms = [b for b in bboxes if b[0] == "bottom"]
@@ -141,9 +143,9 @@ def _split_crop_for_forced_type_from_items(
         elif bottoms:
             boundary = min(b[2] for b in bottoms)  # min y0
         elif dresses:
-            # Dress-only detections: upper half as top proxy.
+            # Dress-only detections: upper portion as top proxy.
             d = max(dresses, key=lambda b: b[4] - b[2])
-            boundary = int(d[2] + 0.52 * (d[4] - d[2]))
+            boundary = int(d[2] + 0.62 * (d[4] - d[2]))
         else:
             boundary = split_y
         top_end = max(1, min(h, int(boundary + top_overlap)))
@@ -157,7 +159,7 @@ def _split_crop_for_forced_type_from_items(
             boundary = max(b[4] for b in tops)  # max y1
         elif dresses:
             d = max(dresses, key=lambda b: b[4] - b[2])
-            boundary = int(d[2] + 0.46 * (d[4] - d[2]))
+            boundary = int(d[2] + 0.38 * (d[4] - d[2]))
         else:
             boundary = split_y
         bottom_start = max(0, min(h - 1, int(boundary - bottom_overlap)))
@@ -1249,6 +1251,13 @@ async def handle_analyze_multipart(file, authorization, selected_type, ctx):
         return _multipart_form_response(payload, binary_parts=yolo_binary_parts)
 
     selected_item = _select_best_item_by_type(item_breakdown, requested_selected_type) if requested_selected_type else None
+
+    # Cross-type satisfaction for single items:
+    # If the user asks for 'top' but we only found a 'dress', favor the resolved
+    # detection instead of forcing an aggressive recovery split.
+    if requested_selected_type and selected_item is None and len(item_breakdown) == 1:
+        selected_item = item_breakdown[0]
+
     forced_selected_image_url = ""
     forced_type_recovery_applied = False
     single_item_type_fallback_enabled = bool(globals().get("ANALYZE_SINGLE_ITEM_TYPE_FALLBACK", True))
@@ -1701,8 +1710,13 @@ async def handle_analyze_multipart(file, authorization, selected_type, ctx):
         and selected_type not in {"top", "bottom"}
     ):
         try:
-            forced_source_image, _ = _download_image(selected_image_url)
-            forced_crop = _split_crop_for_forced_type(forced_source_image, requested_selected_type)
+            # Bug fix: Never split an already-cropped image (recursive zoom).
+            # Always use geometry-aware split from the full source image.
+            forced_crop = _split_crop_for_forced_type_from_items(
+                source_image,
+                requested_selected_type,
+                item_breakdown,
+            )
             try:
                 forced_style_name, forced_style_conf = _run_clip_classification(
                     forced_crop,
