@@ -383,6 +383,8 @@ def _split_single_component_top_bottom(
     base_class_id = int(component.get("class_id", -1))
     base_class_name = str(component.get("class_name", "person"))
     reason_code = int(round(float(split_signal_debug.get("reason_code", 0.0) or 0.0)))
+    color_dist = float(split_signal_debug.get("color_dist", 0.0) or 0.0)
+    texture_delta = float(split_signal_debug.get("texture_delta", 0.0) or 0.0)
     # Keep explicit multi-item only for strong waist-skin evidence (likely crop top).
     # Color/texture-only splits (code 11/12/13/14) are allowed to merge back into dress later
     # if the geometry or parser confirms it looks like a single piece.

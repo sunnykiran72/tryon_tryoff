@@ -1252,12 +1252,6 @@ async def handle_analyze_multipart(file, authorization, selected_type, ctx):
 
     selected_item = _select_best_item_by_type(item_breakdown, requested_selected_type) if requested_selected_type else None
 
-    # Cross-type satisfaction for single items:
-    # If the user asks for 'top' but we only found a 'dress', favor the resolved
-    # detection instead of forcing an aggressive recovery split.
-    if requested_selected_type and selected_item is None and len(item_breakdown) == 1:
-        selected_item = item_breakdown[0]
-
     forced_selected_image_url = ""
     forced_type_recovery_applied = False
     single_item_type_fallback_enabled = bool(globals().get("ANALYZE_SINGLE_ITEM_TYPE_FALLBACK", True))
@@ -1316,11 +1310,15 @@ async def handle_analyze_multipart(file, authorization, selected_type, ctx):
                 logger.warning("Requested type recovery split failed: %s", exc)
                 selected_item = None
 
-        # Cross-type satisfaction fallback should only apply to true single-item
-        # flows; for multi-item responses it can select a wrong garment part.
-        if selected_item is None and single_item_type_fallback_enabled and len(item_breakdown) == 1:
+    # Cross-type satisfaction for single items:
+    # If the user asks for 'top' but we only found a 'dress', favor the resolved
+    # detection instead of forcing an aggressive recovery split.
+    # [FIX] Apply this AFTER attempted recovery so explicit recovery wins if possible.
+    if requested_selected_type and selected_item is None and len(item_breakdown) == 1:
+        if single_item_type_fallback_enabled:
             selected_item = item_breakdown[0]
 
+    if requested_selected_type and selected_item is None:
         if selected_item is None:
             total_s = round(time.perf_counter() - overall_start, 4)
             payload = _build_error_payload(
@@ -1735,7 +1733,7 @@ async def handle_analyze_multipart(file, authorization, selected_type, ctx):
                 prefix=f"analyze_forced_{requested_selected_type}",
                 ext="png",
             )
-            if forced_local_path and (requested_selected_type == "top" or force_split_crop_input):
+            if forced_local_path and (requested_selected_type in {"top", "bottom"} or force_split_crop_input):
                 selected_image_url = f"file://{forced_local_path}"
                 forced_type_split_crop_applied = True
         except Exception as exc:
