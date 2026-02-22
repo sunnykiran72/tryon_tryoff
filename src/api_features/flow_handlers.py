@@ -87,6 +87,85 @@ def _split_crop_for_forced_type(image: Image.Image, forced_type: str) -> Image.I
     return image
 
 
+def _split_crop_for_forced_type_from_items(
+    image: Image.Image,
+    forced_type: str,
+    items: List[Dict[str, object]],
+) -> Image.Image:
+    """Build a deterministic top/bottom crop using detected item boxes when available."""
+    w, h = image.size
+    if w <= 0 or h <= 0:
+        return image
+
+    # Fallback to ratio-only split if no usable bbox metadata exists.
+    bboxes: List[Tuple[str, int, int, int, int]] = []
+    for item in items or []:
+        bbox = item.get("bbox_original")
+        if not isinstance(bbox, dict):
+            continue
+        try:
+            x0 = int(bbox.get("x0", 0))
+            y0 = int(bbox.get("y0", 0))
+            x1 = int(bbox.get("x1", 0))
+            y1 = int(bbox.get("y1", 0))
+        except Exception:
+            continue
+        if x1 <= x0 or y1 <= y0:
+            continue
+        gtype = _normalize_item_garment_type(str(item.get("garment_type", item.get("type", ""))))
+        bboxes.append((gtype, x0, y0, x1, y1))
+
+    if not bboxes:
+        return _split_crop_for_forced_type(image, forced_type)
+
+    aspect = float(h / max(1, w))
+    if aspect >= 2.8:
+        split_ratio = 0.45
+    elif aspect >= 2.2:
+        split_ratio = 0.49
+    else:
+        split_ratio = 0.54
+    split_y = max(1, min(h - 1, int(h * split_ratio)))
+    top_overlap = max(6, min(28, int(h * 0.03)))
+    bottom_overlap = max(10, min(52, int(h * 0.07)))
+
+    tops = [b for b in bboxes if b[0] in {"top", "outer"}]
+    bottoms = [b for b in bboxes if b[0] == "bottom"]
+    dresses = [b for b in bboxes if b[0] == "dress"]
+
+    kind = (forced_type or "").strip().lower()
+    if kind == "top":
+        # Prefer explicit top/outer extent; otherwise cut right above bottom start.
+        if tops:
+            boundary = max(b[4] for b in tops)  # max y1
+        elif bottoms:
+            boundary = min(b[2] for b in bottoms)  # min y0
+        elif dresses:
+            # Dress-only detections: upper half as top proxy.
+            d = max(dresses, key=lambda b: b[4] - b[2])
+            boundary = int(d[2] + 0.52 * (d[4] - d[2]))
+        else:
+            boundary = split_y
+        top_end = max(1, min(h, int(boundary + top_overlap)))
+        return image.crop((0, 0, w, top_end))
+
+    if kind == "bottom":
+        # Prefer explicit bottom start; otherwise start below top/outer extent.
+        if bottoms:
+            boundary = min(b[2] for b in bottoms)  # min y0
+        elif tops:
+            boundary = max(b[4] for b in tops)  # max y1
+        elif dresses:
+            d = max(dresses, key=lambda b: b[4] - b[2])
+            boundary = int(d[2] + 0.46 * (d[4] - d[2]))
+        else:
+            boundary = split_y
+        bottom_start = max(0, min(h - 1, int(boundary - bottom_overlap)))
+        return image.crop((0, bottom_start, w, h))
+
+    return image
+
+
 def _infer_style_from_detector_class_name(class_name: str, garment_type: str) -> Optional[str]:
     name = str(class_name or "").strip().lower()
     gtype = str(garment_type or "").strip().lower()
@@ -1170,15 +1249,70 @@ async def handle_analyze_multipart(file, authorization, selected_type, ctx):
         return _multipart_form_response(payload, binary_parts=yolo_binary_parts)
 
     selected_item = _select_best_item_by_type(item_breakdown, requested_selected_type) if requested_selected_type else None
+    forced_selected_image_url = ""
+    forced_type_recovery_applied = False
     single_item_type_fallback_enabled = bool(globals().get("ANALYZE_SINGLE_ITEM_TYPE_FALLBACK", True))
     if requested_selected_type and selected_item is None:
-        # Cross-type satisfaction: If the user explicitly requested a type (e.g., 'top')
-        # but the analyzer labeled the best candidate as something else (e.g., 'dress'),
-        # we allow the top-ranked item to satisfy the request to avoid 400 rejections,
-        # especially for zoomed-in photos where labeling becomes ambiguous.
-        if single_item_type_fallback_enabled and len(item_breakdown) > 0:
+        # Requested type recovery for top/bottom:
+        # If detector misses explicit top/bottom label, synthesize a deterministic
+        # split crop from the original upload instead of silently using rank-1.
+        if requested_selected_type in {"top", "bottom"} and len(item_breakdown) > 0:
+            try:
+                recovered_crop = _split_crop_for_forced_type_from_items(
+                    source_image,
+                    requested_selected_type,
+                    item_breakdown,
+                )
+                recovered_style, recovered_clip_conf = _run_clip_classification(
+                    recovered_crop,
+                    garment_type=requested_selected_type,
+                )
+                recovered_meta = _wardrobe_category_from_garment_type(
+                    requested_selected_type,
+                    style=recovered_style,
+                )
+                recovered_buf = io.BytesIO()
+                recovered_crop.save(recovered_buf, format="PNG")
+                recovered_bytes = recovered_buf.getvalue()
+                recovered_local_path = _save_local_analyze_image(
+                    recovered_bytes,
+                    prefix=f"analyze_recovered_{requested_selected_type}",
+                    ext="png",
+                )
+                if recovered_local_path:
+                    forced_selected_image_url = f"file://{recovered_local_path}"
+
+                base_item = dict(item_breakdown[0])
+                detector_conf = float(base_item.get("detector_conf", base_item.get("confidence", 0.0)) or 0.0)
+                recovered_combined = max(
+                    float(base_item.get("combined_score", 0.0) or 0.0),
+                    (detector_conf * 0.3) + (float(recovered_clip_conf) * 0.7),
+                )
+                selected_item = {
+                    **base_item,
+                    "garment_type": requested_selected_type,
+                    "type": requested_selected_type,
+                    "style": recovered_meta["style"],
+                    "primary_category_key": recovered_meta["primary_category_key"],
+                    "category_key": recovered_meta["category_key"],
+                    "clip_confidence": round(float(recovered_clip_conf), 4),
+                    "combined_score": round(float(recovered_combined), 4),
+                    "confidence": round(float(recovered_combined), 4),
+                    "source": "forced_type_recovery_split",
+                }
+                if forced_selected_image_url:
+                    selected_item["image_url"] = forced_selected_image_url
+                forced_type_recovery_applied = True
+            except Exception as exc:
+                logger.warning("Requested type recovery split failed: %s", exc)
+                selected_item = None
+
+        # Cross-type satisfaction fallback should only apply to true single-item
+        # flows; for multi-item responses it can select a wrong garment part.
+        if selected_item is None and single_item_type_fallback_enabled and len(item_breakdown) == 1:
             selected_item = item_breakdown[0]
-        else:
+
+        if selected_item is None:
             total_s = round(time.perf_counter() - overall_start, 4)
             payload = _build_error_payload(
                 title="Invalid Selection Type",
@@ -1296,13 +1430,29 @@ async def handle_analyze_multipart(file, authorization, selected_type, ctx):
         if likely_single_full_piece:
             should_split_to_multi = False
 
+        # Additional protection: If the only candidate is quite tall/centered, 
+        # it's likely a dress or untucked shirt. Do not force a split.
+        if (
+            not requested_selected_type 
+            and len(item_breakdown) == 1 
+            and selected_h_ratio >= 0.58
+            and selected_w_ratio >= 0.28
+        ):
+            should_split_to_multi = False
+
         if should_split_to_multi:
             try:
-                split_source_image, _ = _download_image(selected_image_url_for_split)
+                # Always split from the full source image (unmodified upload) to ensure
+                # deterministic cropping and prevent recursive zoom compounding.
                 split_items: List[Dict[str, object]] = []
                 split_binary_parts: List[Dict[str, object]] = []
                 for rank_idx, forced_kind in enumerate(["top", "bottom"], start=1):
-                    crop_image = _split_crop_for_forced_type(split_source_image, forced_kind)
+                    # Use geometry-aware split line based on detected items.
+                    crop_image = _split_crop_for_forced_type_from_items(
+                        source_image,
+                        forced_kind,
+                        item_breakdown,
+                    )
                     out_buf = io.BytesIO()
                     crop_image.save(out_buf, format="PNG")
                     crop_bytes = out_buf.getvalue()
@@ -1351,7 +1501,7 @@ async def handle_analyze_multipart(file, authorization, selected_type, ctx):
                     "result": "REJECTED",
                     "title": "Multiple Items Found",
                     "description": "Multiple garments were detected. Please select a type (top, bottom, dress, outer) and re-upload to continue.",
-                    "reason_codes": ["MULTI_ITEM_SELECTION_REQUIRED", "LOW_CONFIDENCE_SPLIT_REQUIRED"],
+                    "reason_codes": ["MULTI_ITEM_SELECTION_REQUIRED"],
                     "selection_required": True,
                     "total_garments_found": len(split_items),
                     "selection_hint": {
@@ -1368,6 +1518,7 @@ async def handle_analyze_multipart(file, authorization, selected_type, ctx):
                     "processing_time_ms": int(total_s * 1000),
                     "debug": {
                         "trigger": "low_confidence_split_to_multi",
+                        "split_source": "full_source_image",
                         "combined_score": round(combined_score, 4),
                         "clip_confidence": round(clip_conf, 4),
                         "thresholds": {"combined": MIN_COMBINED_SCORE, "clip": MIN_CLIP_CONF},
@@ -1419,6 +1570,60 @@ async def handle_analyze_multipart(file, authorization, selected_type, ctx):
             })
         return _multipart_form_response(payload, binary_parts=yolo_binary_parts)
 
+    # For explicit type requests, detector bboxes can sometimes be too tight
+    # (especially bottoms detected from occluded scenes). Recover from split crop
+    # when confidence/geometry indicates a truncated candidate.
+    forced_type_bbox_recovery_applied = False
+    if requested_selected_type in {"top", "bottom"} and not forced_type_recovery_applied:
+        bbox = selected_item.get("bbox_original") if isinstance(selected_item, dict) else None
+        clip_conf = float(selected_item.get("clip_confidence", 0.0) or 0.0)
+        selected_src = str(selected_item.get("source", "")).lower().strip()
+
+        h_ratio = 1.0
+        y0_ratio = 0.0
+        y1_ratio = 1.0
+        if isinstance(bbox, dict):
+            try:
+                y0v = int(bbox.get("y0", 0))
+                y1v = int(bbox.get("y1", source_image.height))
+                h_ratio = float(max(1, y1v - y0v) / max(1, int(source_image.height)))
+                y0_ratio = float(max(0, y0v) / max(1, int(source_image.height)))
+                y1_ratio = float(max(0, y1v) / max(1, int(source_image.height)))
+            except Exception:
+                pass
+
+        should_recover = False
+        if requested_selected_type == "bottom":
+            if clip_conf < 0.20 and (h_ratio < 0.50 or y0_ratio > 0.48):
+                should_recover = True
+            if selected_src in {"yolo", "yolo_person", "parser_category_overlap_fallback"} and h_ratio < 0.42:
+                should_recover = True
+        else:  # top
+            if clip_conf < 0.20 and h_ratio < 0.48:
+                should_recover = True
+            if selected_src in {"yolo", "yolo_person", "parser_category_overlap_fallback"} and y1_ratio < 0.58:
+                should_recover = True
+
+        if should_recover:
+            try:
+                recovered_crop = _split_crop_for_forced_type_from_items(
+                    source_image,
+                    requested_selected_type,
+                    item_breakdown,
+                )
+                recovered_buf = io.BytesIO()
+                recovered_crop.save(recovered_buf, format="PNG")
+                recovered_path = _save_local_analyze_image(
+                    recovered_buf.getvalue(),
+                    prefix=f"analyze_recovered_bbox_{requested_selected_type}",
+                    ext="png",
+                )
+                if recovered_path:
+                    forced_selected_image_url = f"file://{recovered_path}"
+                    forced_type_bbox_recovery_applied = True
+            except Exception as exc:
+                logger.warning("Forced type bbox recovery failed: %s", exc)
+
     selected_component_id = int(selected_item.get("component_id", -1))
     selected_rank = int(selected_item.get("rank", -1))
     use_isolated_top_crop = bool(globals().get("ANALYZE_USE_ISOLATED_TOP_CROP", False))
@@ -1432,7 +1637,7 @@ async def handle_analyze_multipart(file, authorization, selected_type, ctx):
     # For `bottom`, keep raw crop priority so waistband/shape context is preserved.
     # Rank-level previews are type-specific and must win when a single detector component
     # is split into top/bottom parser categories that share the same component_id.
-    selected_image_url = ""
+    selected_image_url = forced_selected_image_url.strip()
     if forced_type_uses_isolated:
         selected_image_url = str(
             internal_isolated_image_url_by_rank.get(selected_rank, "")
@@ -1575,6 +1780,10 @@ async def handle_analyze_multipart(file, authorization, selected_type, ctx):
         reason_codes.append("TYPE_FALLBACK_SINGLE_ITEM")
     if forced_type_split_crop_applied:
         reason_codes.append("TYPE_FORCED_SPLIT_CROP")
+    if forced_type_recovery_applied:
+        reason_codes.append("TYPE_RECOVERED_FROM_SPLIT")
+    if forced_type_bbox_recovery_applied:
+        reason_codes.append("TYPE_RECOVERED_FROM_BBOX_SPLIT")
 
     user_id = str(auth_payload.get("userId"))
     progress_id = str(uuid.uuid4())

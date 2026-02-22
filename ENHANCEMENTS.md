@@ -147,6 +147,25 @@ In zoomed photos, the "image height" is no longer a reliable proxy for "person h
 
 ---
 
+## Issue 7: Recursive Zoom and Context Compounding (Split Previews)
+
+### **Image Evidence (Crochet Crop Top / Patterned Dress)**
+
+- **Original:** `test1.jpeg`, `test2.png`
+- **Failure State:** Previews in "Multiple Items Found" response were sometimes truncated or "bottom-half" only, even for top candidates.
+
+### **The Problem (Sub-Crop Splitting)**
+
+When the system was uncertain, it attempted to split a candidate into top/bottom previews. However, it was splitting from a previously-trimmed sub-crop (the "selected item crop") rather than the global source image. If the sub-crop was already biased (e.g., just the waist-down region), the resulting "top" preview was actually just a slice of the pants.
+
+### **Resolution Strategy (Global Split)**
+
+- **Global Context:** Modified `flow_handlers.py` to always use the `source_image` (full upload) for synthesizing previews in the low-confidence split flow.
+- **Geometry-Aware Cut:** Switched to `_split_crop_for_forced_type_from_items` which uses all detected bounding boxes to calculate the mathematically optimal horizon line for the split.
+- **Dress Protection:** Added a height-based guard (`h_ratio >= 0.58`) to prevent prominent single pieces (like midi dresses) from being forced into a split-type response.
+
+---
+
 ## Commit Review Notes (2026-02-22)
 
 Verified commit chain:
