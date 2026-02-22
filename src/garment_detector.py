@@ -275,9 +275,10 @@ def detect_garment_instances(
             h_ratio_local = float(max(1, y1 - y0) / max(1, h))
             if garment_type is None and is_person:
                 garment_type = _infer_garment_type_from_bbox(y0, y1, h)
-            elif garment_type == "top" and h_ratio_local >= 0.60:
+            elif garment_type == "top" and h_ratio_local >= 0.75:
                 # Override YOLO classification if the geometry explicitly screams dress
-                # but YOLO mistakenly predicted "shirt" (e.g. for long-sleeved dresses)
+                # but YOLO mistakenly predicted "shirt". 
+                # Raised to 0.75 to prevent crop-top sets from being mislabeled as dresses.
                 garment_type = "dress"
             instance_payload = {
                 "mask": mask_bool,
