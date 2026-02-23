@@ -154,6 +154,22 @@ def _mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     return float(inter / union)
 
 
+def _bbox_x_overlap_ratio(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+    ax0, _, ax1, _ = [int(v) for v in a]
+    bx0, _, bx1, _ = [int(v) for v in b]
+    inter = max(0, min(ax1, bx1) - max(ax0, bx0))
+    min_width = max(1, min(max(1, ax1 - ax0), max(1, bx1 - bx0)))
+    return float(inter / min_width)
+
+
+def _bbox_vertical_gap(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> int:
+    _, ay0, _, ay1 = [int(v) for v in a]
+    _, by0, _, by1 = [int(v) for v in b]
+    if ay0 <= by0:
+        return max(0, by0 - ay1)
+    return max(0, ay0 - by1)
+
+
 def _resolve_detector_model_paths(explicit_path: Optional[str] = None) -> List[str]:
     candidates = [
         explicit_path or "",
@@ -254,6 +270,12 @@ def detect_garment_instances(
 
         strict_instances: List[Dict[str, object]] = []
         generic_fallback_instances: List[Dict[str, object]] = []
+        # Common detector misspelling aliases from custom models.
+        class_aliases = {
+            "outwear": "outerwear",
+            "long sleeved outwear": "long sleeved outerwear",
+            "short sleeved outwear": "short sleeved outerwear",
+        }
         for idx, raw_mask in enumerate(mask_tensor):
             mask_resized = _resize_mask_to_image(raw_mask, w, h)
             mask_bool = mask_resized > 0.5
@@ -269,6 +291,7 @@ def detect_garment_instances(
             conf = float(conf_tensor[idx]) if conf_tensor is not None and idx < len(conf_tensor) else 0.0
             class_id = int(cls_tensor[idx]) if cls_tensor is not None and idx < len(cls_tensor) else -1
             class_name = _normalize_label_name(str(names.get(class_id, "")))
+            class_name = class_aliases.get(class_name, class_name)
             is_person = _is_person_like_class(class_name, class_id)
             is_garment_class = _is_garment_like_class(class_name)
             garment_type = _infer_garment_type_from_class_name(class_name)
@@ -312,7 +335,73 @@ def detect_garment_instances(
                 instance_payload["source"] = "yolo_generic_fallback"
                 generic_fallback_instances.append(instance_payload)
 
-        instances = strict_instances if strict_instances else generic_fallback_instances
+        strict_garments = [inst for inst in strict_instances if not bool(inst.get("is_person"))]
+        person_instances = [inst for inst in strict_instances if bool(inst.get("is_person"))]
+
+        # Start with strict outputs. If only generic outputs exist, keep generic path.
+        instances = list(strict_instances) if strict_instances else list(generic_fallback_instances)
+
+        merged_generic_count = 0
+        rejected_generic_count = 0
+        if strict_instances and generic_fallback_instances:
+            person_mask: Optional[np.ndarray] = None
+            if person_instances:
+                person_mask = np.zeros((h, w), dtype=bool)
+                for p in person_instances:
+                    person_mask |= np.asarray(p.get("mask", np.zeros((h, w), dtype=bool))).astype(bool)
+            accepted_generics: List[Dict[str, object]] = []
+            for candidate in generic_fallback_instances:
+                c_mask = np.asarray(candidate.get("mask", np.zeros((h, w), dtype=bool))).astype(bool)
+                c_bbox = tuple(candidate.get("bbox", (0, 0, 0, 0)))
+                c_area = max(1, int(candidate.get("area", 0)))
+                c_area_ratio = float(candidate.get("area_ratio", c_area / img_area))
+                c_conf = float(candidate.get("detector_conf", 0.0))
+
+                if c_conf < max(0.20, min_conf * 0.70):
+                    rejected_generic_count += 1
+                    continue
+
+                # Reject unusually huge generic blobs when strict garments already exist.
+                if strict_garments and c_area_ratio > 0.48:
+                    rejected_generic_count += 1
+                    continue
+
+                # Avoid duplicates against strict/accepted candidates.
+                duplicate = False
+                compare_pool = strict_garments + accepted_generics
+                for kept in compare_pool:
+                    if _mask_iou(c_mask, np.asarray(kept.get("mask", np.zeros((h, w), dtype=bool))).astype(bool)) >= 0.82:
+                        duplicate = True
+                        break
+                if duplicate:
+                    rejected_generic_count += 1
+                    continue
+
+                # Clothing-only spatial guard:
+                # - if strict garments exist, candidate must be spatially tied to them
+                # - otherwise, if person exists, candidate must overlap person region
+                spatial_ok = True
+                if strict_garments:
+                    max_x = 0.0
+                    min_gap = h
+                    for kept in strict_garments:
+                        k_bbox = tuple(kept.get("bbox", (0, 0, 0, 0)))
+                        max_x = max(max_x, _bbox_x_overlap_ratio(c_bbox, k_bbox))
+                        min_gap = min(min_gap, _bbox_vertical_gap(c_bbox, k_bbox))
+                    spatial_ok = (max_x >= 0.18) and (min_gap <= int(h * 0.30))
+                elif person_mask is not None and int(person_mask.sum()) > 0:
+                    person_overlap = float((c_mask & person_mask).sum() / max(1, c_area))
+                    spatial_ok = person_overlap >= 0.08
+
+                if not spatial_ok:
+                    rejected_generic_count += 1
+                    continue
+
+                accepted_generics.append(candidate)
+                merged_generic_count += 1
+
+            if accepted_generics:
+                instances.extend(accepted_generics)
         
         # If we have specific garment boxes, suppress the redundant 'person' boxes
         # which often just wrap the same area and cause MULTI_ITEM prompts.
@@ -346,6 +435,8 @@ def detect_garment_instances(
                 "raw_instances": int(len(mask_tensor)),
                 "strict_kept_instances": int(len(strict_instances)),
                 "generic_fallback_kept_instances": int(len(generic_fallback_instances)),
+                "generic_merged_into_output": int(merged_generic_count),
+                "generic_rejected_after_merge_checks": int(rejected_generic_count),
                 "kept_instances": int(len(instances)),
             }
 
