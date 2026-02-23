@@ -24,6 +24,12 @@ class YoloCropperConfig:
     analyze_multi_item_preview_keep_occluders: bool
     analyze_multi_item_isolate_min_mask_ratio: float
     analyze_multi_item_isolate_trim_padding_px: int
+    analyze_pretrim_empty_border: bool
+    analyze_pretrim_diff_threshold: int
+    analyze_pretrim_min_content_ratio: float
+    analyze_symmetric_padding_only: bool
+    analyze_min_padding_px: int
+    analyze_min_padding_ratio: float
 
 
 @dataclass
@@ -116,6 +122,110 @@ def _expand_bbox_for_preview(
     if y1 <= y0:
         y0, y1 = 0, image_height
     return (x0, y0, x1, y1)
+
+
+def _expand_bbox_symmetric(
+    *,
+    bbox: Tuple[int, int, int, int],
+    image_width: int,
+    image_height: int,
+    base_padding_px: int,
+    min_padding_px: int,
+    min_padding_ratio: float,
+) -> Tuple[int, int, int, int]:
+    x0, y0, x1, y1 = [int(v) for v in bbox]
+    bw = max(1, x1 - x0)
+    bh = max(1, y1 - y0)
+    ratio_pad = int(round(max(1, max(bw, bh)) * max(0.0, float(min_padding_ratio))))
+    pad = max(0, int(base_padding_px), int(min_padding_px), ratio_pad)
+
+    x0 = max(0, x0 - pad)
+    y0 = max(0, y0 - pad)
+    x1 = min(image_width, x1 + pad)
+    y1 = min(image_height, y1 + pad)
+
+    if x1 <= x0:
+        x0, x1 = 0, image_width
+    if y1 <= y0:
+        y0, y1 = 0, image_height
+    return (x0, y0, x1, y1)
+
+
+def _trim_empty_border(
+    source_image: Image.Image,
+    *,
+    diff_threshold: int,
+    min_content_ratio: float,
+) -> Tuple[Image.Image, Tuple[int, int], Dict[str, object]]:
+    rgb = np.asarray(source_image.convert("RGB"), dtype=np.float32)
+    h, w = rgb.shape[:2]
+    debug: Dict[str, object] = {
+        "enabled": True,
+        "applied": False,
+        "offset_x": 0,
+        "offset_y": 0,
+        "orig_size": {"width": int(w), "height": int(h)},
+    }
+
+    if h < 32 or w < 32:
+        debug["reason"] = "image_too_small"
+        return source_image, (0, 0), debug
+
+    edge = max(2, int(round(min(h, w) * 0.04)))
+    border_pixels = np.concatenate(
+        [
+            rgb[:edge, :, :].reshape(-1, 3),
+            rgb[h - edge :, :, :].reshape(-1, 3),
+            rgb[:, :edge, :].reshape(-1, 3),
+            rgb[:, w - edge :, :].reshape(-1, 3),
+        ],
+        axis=0,
+    )
+    bg = np.median(border_pixels, axis=0)
+    diff = np.linalg.norm(rgb - bg[None, None, :], axis=2)
+    threshold = float(max(3, int(diff_threshold)))
+    content_mask = diff >= threshold
+    content_pixels = int(content_mask.sum())
+    content_ratio = float(content_pixels / max(1, h * w))
+    debug["content_ratio"] = round(content_ratio, 6)
+    debug["threshold"] = round(threshold, 4)
+
+    min_ratio = max(0.005, min(0.95, float(min_content_ratio)))
+    if content_ratio < min_ratio:
+        debug["reason"] = "content_ratio_too_low"
+        return source_image, (0, 0), debug
+
+    ys, xs = np.where(content_mask)
+    if len(xs) == 0 or len(ys) == 0:
+        debug["reason"] = "empty_content_mask"
+        return source_image, (0, 0), debug
+
+    x0 = max(0, int(xs.min()))
+    y0 = max(0, int(ys.min()))
+    x1 = min(w, int(xs.max()) + 1)
+    y1 = min(h, int(ys.max()) + 1)
+
+    if x0 <= 1 and y0 <= 1 and x1 >= (w - 1) and y1 >= (h - 1):
+        debug["reason"] = "already_full_frame"
+        return source_image, (0, 0), debug
+
+    trimmed_w = max(1, x1 - x0)
+    trimmed_h = max(1, y1 - y0)
+    if trimmed_w < int(w * 0.30) or trimmed_h < int(h * 0.30):
+        debug["reason"] = "trimmed_box_too_small"
+        return source_image, (0, 0), debug
+
+    trimmed = source_image.crop((x0, y0, x1, y1))
+    debug.update(
+        {
+            "applied": True,
+            "offset_x": int(x0),
+            "offset_y": int(y0),
+            "trimmed_size": {"width": int(trimmed.width), "height": int(trimmed.height)},
+            "reason": "ok",
+        }
+    )
+    return trimmed, (x0, y0), debug
 
 
 def _bbox_from_mask(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
@@ -737,7 +847,22 @@ def build_yolo_item_breakdown_from_image(
     logger,
 ) -> Dict[str, object]:
     max_items = max(1, min(5, int(max_items)))
-    image_area = int(source_image.width * source_image.height)
+    working_image = source_image
+    origin_offset_x = 0
+    origin_offset_y = 0
+    pretrim_debug: Dict[str, object] = {
+        "enabled": bool(config.analyze_pretrim_empty_border),
+        "applied": False,
+        "reason": "disabled_by_config",
+    }
+    if config.analyze_pretrim_empty_border:
+        working_image, (origin_offset_x, origin_offset_y), pretrim_debug = _trim_empty_border(
+            source_image,
+            diff_threshold=int(config.analyze_pretrim_diff_threshold),
+            min_content_ratio=float(config.analyze_pretrim_min_content_ratio),
+        )
+
+    image_area = int(working_image.width * working_image.height)
     min_component_area_ratio = max(0.0005, min(0.2, config.analyze_min_component_area_ratio))
     min_area_pixels_by_ratio = max(128, int(image_area * max(0.0005, min_component_area_ratio)))
     min_item_pixels = max(1, int(min_item_pixels), min_area_pixels_by_ratio)
@@ -755,7 +880,7 @@ def build_yolo_item_breakdown_from_image(
 
     if config.detect_use_yolo:
         raw_instances, detector_debug = deps.detect_garment_instances_fn(
-            image=source_image,
+            image=working_image,
             max_items=internal_max_candidates,
             min_conf=max(0.01, min(0.95, config.analyze_yolo_min_conf)),
             min_area_ratio=max(0.0005, min(0.2, config.analyze_yolo_min_area_ratio)),
@@ -767,7 +892,7 @@ def build_yolo_item_breakdown_from_image(
             detection_source = "yolo"
 
     parsing: Optional[np.ndarray] = None
-    garment_mask = np.zeros((source_image.height, source_image.width), dtype=bool)
+    garment_mask = np.zeros((working_image.height, working_image.width), dtype=bool)
     occluder_mask = np.zeros_like(garment_mask)
     parser_category_components: List[Dict[str, object]] = []
     parser_category_debug: Dict[str, object] = {
@@ -782,7 +907,7 @@ def build_yolo_item_breakdown_from_image(
     }
 
     if config.analyze_use_human_parser:
-        parsing = deps.run_human_parsing_fn(source_image)
+        parsing = deps.run_human_parsing_fn(working_image)
         garment_labels, occluder_labels, _ = deps.resolve_label_ids_from_model_fn("all")
 
         garment_mask = np.isin(parsing, list(garment_labels))
@@ -861,7 +986,7 @@ def build_yolo_item_breakdown_from_image(
                 else:
                     fallback_split = _split_single_component_top_bottom(
                         components[0],
-                        source_image=source_image,
+                        source_image=working_image,
                         min_area_pixels=min_item_pixels,
                     )
                     if len(fallback_split) == 2:
@@ -875,7 +1000,7 @@ def build_yolo_item_breakdown_from_image(
                 components = components[:1]
                 fallback_split = _split_single_component_top_bottom(
                     components[0],
-                    source_image=source_image,
+                    source_image=working_image,
                     min_area_pixels=min_item_pixels,
                 )
                 if len(fallback_split) == 2:
@@ -886,7 +1011,7 @@ def build_yolo_item_breakdown_from_image(
 
         if not components:
             fallback_component = _build_foreground_fallback_component(
-                source_image=source_image,
+                source_image=working_image,
                 min_area_pixels=min_item_pixels,
                 cv2_module=deps.cv2_module,
             )
@@ -960,8 +1085,8 @@ def build_yolo_item_breakdown_from_image(
             component["garment_type_overlap"] = {k: round(v, 4) for k, v in overlap_by_type.items()}
         else:
             if not has_valid_current:
-                bbox = tuple(component.get("bbox", (0, 0, source_image.width, source_image.height)))
-                inferred_type = _infer_garment_type_from_bbox_for_parserless(bbox, source_image.height)
+                bbox = tuple(component.get("bbox", (0, 0, working_image.width, working_image.height)))
+                inferred_type = _infer_garment_type_from_bbox_for_parserless(bbox, working_image.height)
                 component["garment_type"] = inferred_type
                 component["garment_type_source"] = "bbox_parserless"
             component["garment_type_score"] = round(float(component.get("detector_conf", 0.0) or 0.0), 4)
@@ -974,10 +1099,10 @@ def build_yolo_item_breakdown_from_image(
     )
     size_filtered_components, candidate_postprocess_debug = deps.postprocess_single_piece_candidates_fn(
         size_filtered_components,
-        image_height=source_image.height,
+        image_height=working_image.height,
         min_item_pixels=min_item_pixels,
         parsing=parsing,
-        source_image=source_image,
+        source_image=working_image,
     )
     selected_components = size_filtered_components[:max_items]
 
@@ -990,17 +1115,28 @@ def build_yolo_item_breakdown_from_image(
         if str(inst.get("source", detection_source)) == "foreground_fallback":
             component_padding_px = max(
                 component_padding_px,
-                int(max(16, round(0.06 * max(source_image.width, source_image.height)))),
+                int(max(16, round(0.06 * max(working_image.width, working_image.height)))),
             )
-        expanded_bbox = _expand_bbox_for_preview(
-            bbox=tuple(inst.get("bbox", (0, 0, source_image.width, source_image.height))),
-            garment_type=str(inst.get("garment_type", "")),
-            image_width=source_image.width,
-            image_height=source_image.height,
-            base_padding_px=component_padding_px,
-        )
+        inst_bbox = tuple(inst.get("bbox", (0, 0, working_image.width, working_image.height)))
+        if config.analyze_symmetric_padding_only:
+            expanded_bbox = _expand_bbox_symmetric(
+                bbox=inst_bbox,
+                image_width=working_image.width,
+                image_height=working_image.height,
+                base_padding_px=component_padding_px,
+                min_padding_px=max(0, int(config.analyze_min_padding_px)),
+                min_padding_ratio=max(0.0, float(config.analyze_min_padding_ratio)),
+            )
+        else:
+            expanded_bbox = _expand_bbox_for_preview(
+                bbox=inst_bbox,
+                garment_type=str(inst.get("garment_type", "")),
+                image_width=working_image.width,
+                image_height=working_image.height,
+                base_padding_px=component_padding_px,
+            )
         crop_image, crop_mask, crop_bbox = crop_from_bbox_with_padding(
-            image=source_image,
+            image=working_image,
             mask=component_mask,
             bbox=expanded_bbox,
             padding_px=0,
@@ -1036,12 +1172,17 @@ def build_yolo_item_breakdown_from_image(
             "is_safe": is_safe,
             "source": str(inst.get("source", detection_source)),
             "bbox_original": {
-                "x0": int(inst.get("bbox", (0, 0, 0, 0))[0]),
-                "y0": int(inst.get("bbox", (0, 0, 0, 0))[1]),
-                "x1": int(inst.get("bbox", (0, 0, 0, 0))[2]),
-                "y1": int(inst.get("bbox", (0, 0, 0, 0))[3]),
+                "x0": int(inst.get("bbox", (0, 0, 0, 0))[0]) + int(origin_offset_x),
+                "y0": int(inst.get("bbox", (0, 0, 0, 0))[1]) + int(origin_offset_y),
+                "x1": int(inst.get("bbox", (0, 0, 0, 0))[2]) + int(origin_offset_x),
+                "y1": int(inst.get("bbox", (0, 0, 0, 0))[3]) + int(origin_offset_y),
             },
-            "bbox_crop": {"x0": int(x0), "y0": int(y0), "x1": int(x1), "y1": int(y1)},
+            "bbox_crop": {
+                "x0": int(x0) + int(origin_offset_x),
+                "y0": int(y0) + int(origin_offset_y),
+                "x1": int(x1) + int(origin_offset_x),
+                "y1": int(y1) + int(origin_offset_y),
+            },
             "crop_size": {"width": int(crop_image.width), "height": int(crop_image.height)},
             "garment_pixels": area,
             "class_id": int(inst.get("class_id", -1)),
@@ -1195,6 +1336,7 @@ def build_yolo_item_breakdown_from_image(
         "detector_debug": detector_debug,
         "parser_category_debug": parser_category_debug,
         "candidate_postprocess_debug": candidate_postprocess_debug,
+        "pretrim_debug": pretrim_debug,
         "item_breakdown": item_breakdown,
         "binary_parts": binary_parts,
         "raw_debug": detector_debug,

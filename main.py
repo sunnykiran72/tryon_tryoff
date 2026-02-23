@@ -402,6 +402,12 @@ ANALYZE_USE_HUMAN_PARSER = os.getenv("ANALYZE_USE_HUMAN_PARSER", "false").lower(
 ANALYZE_MIN_COMPONENT_AREA_RATIO = float(os.getenv("ANALYZE_MIN_COMPONENT_AREA_RATIO", "0.005"))
 ANALYZE_MIN_ITEM_PIXELS = int(os.getenv("ANALYZE_MIN_ITEM_PIXELS", str(max(1200, DETECT_MIN_ITEM_PIXELS))))
 ANALYZE_CROP_PADDING_PX = int(os.getenv("ANALYZE_CROP_PADDING_PX", "12"))
+ANALYZE_PRETRIM_EMPTY_BORDER = os.getenv("ANALYZE_PRETRIM_EMPTY_BORDER", "false").lower() == "true"
+ANALYZE_PRETRIM_DIFF_THRESHOLD = int(os.getenv("ANALYZE_PRETRIM_DIFF_THRESHOLD", "18"))
+ANALYZE_PRETRIM_MIN_CONTENT_RATIO = float(os.getenv("ANALYZE_PRETRIM_MIN_CONTENT_RATIO", "0.02"))
+ANALYZE_SYMMETRIC_PADDING_ONLY = os.getenv("ANALYZE_SYMMETRIC_PADDING_ONLY", "false").lower() == "true"
+ANALYZE_MIN_PADDING_PX = int(os.getenv("ANALYZE_MIN_PADDING_PX", "8"))
+ANALYZE_MIN_PADDING_RATIO = float(os.getenv("ANALYZE_MIN_PADDING_RATIO", "0.02"))
 ANALYZE_OCCLUSION_THRESHOLD = float(os.getenv("ANALYZE_OCCLUSION_THRESHOLD", "0.10"))
 ANALYZE_FORCE_VTON_FOR_SINGLE_PIECE_DRESS = os.getenv(
     "ANALYZE_FORCE_VTON_FOR_SINGLE_PIECE_DRESS",
@@ -515,6 +521,12 @@ def _yolo_cropper_config() -> YoloCropperConfig:
         analyze_multi_item_preview_keep_occluders=ANALYZE_MULTI_ITEM_PREVIEW_KEEP_OCCLUDERS,
         analyze_multi_item_isolate_min_mask_ratio=ANALYZE_MULTI_ITEM_ISOLATE_MIN_MASK_RATIO,
         analyze_multi_item_isolate_trim_padding_px=ANALYZE_MULTI_ITEM_ISOLATE_TRIM_PADDING_PX,
+        analyze_pretrim_empty_border=ANALYZE_PRETRIM_EMPTY_BORDER,
+        analyze_pretrim_diff_threshold=ANALYZE_PRETRIM_DIFF_THRESHOLD,
+        analyze_pretrim_min_content_ratio=ANALYZE_PRETRIM_MIN_CONTENT_RATIO,
+        analyze_symmetric_padding_only=ANALYZE_SYMMETRIC_PADDING_ONLY,
+        analyze_min_padding_px=ANALYZE_MIN_PADDING_PX,
+        analyze_min_padding_ratio=ANALYZE_MIN_PADDING_RATIO,
     )
 
 
@@ -2532,6 +2544,12 @@ def health_check():
         "analyze_multi_item_isolate_min_mask_ratio": ANALYZE_MULTI_ITEM_ISOLATE_MIN_MASK_RATIO,
         "analyze_multi_item_isolate_trim_padding_px": ANALYZE_MULTI_ITEM_ISOLATE_TRIM_PADDING_PX,
         "analyze_min_component_area_ratio": ANALYZE_MIN_COMPONENT_AREA_RATIO,
+        "analyze_pretrim_empty_border": ANALYZE_PRETRIM_EMPTY_BORDER,
+        "analyze_pretrim_diff_threshold": ANALYZE_PRETRIM_DIFF_THRESHOLD,
+        "analyze_pretrim_min_content_ratio": ANALYZE_PRETRIM_MIN_CONTENT_RATIO,
+        "analyze_symmetric_padding_only": ANALYZE_SYMMETRIC_PADDING_ONLY,
+        "analyze_min_padding_px": ANALYZE_MIN_PADDING_PX,
+        "analyze_min_padding_ratio": ANALYZE_MIN_PADDING_RATIO,
         "analyze_local_items_dir": ANALYZE_LOCAL_ITEMS_DIR,
         "wardrobe_progress_sync_enabled": ENABLE_WARDROBE_PROGRESS_SYNC,
         "wardrobe_progress_api_configured": bool(WARDROBE_PROGRESS_API_BASE_URL),
